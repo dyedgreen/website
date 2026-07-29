@@ -1,0 +1,48 @@
+<!DOCTYPE html>
+<html lang="en">
+    <head>
+        <meta charset="utf-8">
+        <meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=yes">
+        <meta name="author" content="Tilman Roeder">
+        <link rel="stylesheet" href="index.css">
+        <title>Setting the wallpaper on macOS</title>
+    </head>
+    <body>
+        <nav>
+            <a href="/">← homepage</a>
+            <h2>Tilman Roeder &mdash; Jun 17 2019</h2>
+        </nav>
+        <header>
+            <h1 class="title">Setting the wallpaper on macOS</h1>
+        </header>
+        <article>
+            <p>
+                When trying to set up a bash script to update the wallpaper on my Mac, I ran
+            into this wired issue. Basically, the wallpapers of each space / desktop are
+            really <em>smart</em> and change independently. So after some frantic Internet
+            searches, I found out the following:
+            </p>
+            <ul>
+            <li>The different spaces seem to be managed by the Dock (?, at least their stuff
+            is stored in <code>~/Library/Application\ Support/Dock/</code>)</li>
+            <li>Which picture each desktop should have is stored in an SQLite database file</li>
+            <li>The image paths are stored in the <code>data</code> table (the relevant column is
+            <code>value</code>)</li>
+            <li>To apply the changes, you have to restart the Dock</li>
+            <li>If you want to change to also apply to different monitors and behind your
+            fullscreen windows, there is a neat little AppleScript for that:</li>
+            </ul>
+            <h1>TL;DR</h1>
+            <pre><code class="language-bash">function background {
+    IMG=$1
+    osascript -e "tell application \"System Events\" to set picture of every desktop to \"${IMG}\""
+    sqlite3 ~/Library/Application\ Support/Dock/desktoppicture.db "update data set value = '${IMG}'"
+    killall Dock
+}</code></pre>
+            <p>Let's hope this post will save someone like me a few searches and head-scratches 😅.
+            By the way, I use <a href="https://unsplash.com">Unsplash</a> to download the fresh
+            backgrounds, and have amassed<br>
+            <a href="https://unsplash.com/collections/4764121/">a nice little collection of suitable pictures</a>.</p>
+        </article>
+    </body>
+</html>

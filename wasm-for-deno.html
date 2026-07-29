@@ -4,15 +4,287 @@
         <meta charset="utf-8">
         <meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=yes">
         <meta name="author" content="Tilman Roeder">
-        <link rel="stylesheet" href="styles/index.css">
+        <link rel="stylesheet" href="index.css">
         <title>Building WebAssembly for Deno</title>
     </head>
     <body>
+        <nav>
+            <a href="/">← homepage</a>
+            <h2>Tilman Roeder &mdash; Dec 23 2019</h2>
+        </nav>
         <header>
             <h1 class="title">Building WebAssembly for Deno</h1>
-            <p>A guide to WASM targeting Deno.</p>
         </header>
-        <h2>Articles</h2>
-        <!-- TODO: Write the content -->
+        <article>
+            <p>
+                Recently, I started building a <a href="https://dyedgreen.github.io/deno-sqlite">SQLite3 module</a>
+                for <a href="https://deno.land">Deno</a>. The module works by compiling SQLite3 with
+                a custom <a href="https://www.sqlite.org/vfs.html">'Virtual File System (VFS)'</a> to
+                WASM and wrapping it in a small JavaScript API.
+                Throughout the project I learned a lot about compiling WASM modules, avoiding
+                JavaScript glue code, and even got to expose
+                <a href="https://github.com/denoland/deno/issues/3498">two</a>
+                <a href="https://github.com/denoland/deno/issues/3528">issues</a> with Deno.
+            </p>
+            <p>
+                Using a compiled language like C and importing it to JavaScript is really
+                exciting! It enables modules that are much faster than anything we could write
+                in JavaScript and let's us use libraries like SQLite3 without platform-specific
+                runtime extensions. Below is a tutorial on compiling C libraries for use with Deno.
+            </p>
+
+            <h2>A simple demo module</h2>
+            <p>
+                Let's start with a <code>module.c</code> which will allow us to use a few simple c
+                functions.
+            </p>
+<pre><code class="language-c">int total_count = 0;
+
+// Modules can have state
+int count() {
+  return ++total_count;
+}
+
+// They can do work
+int add(int a, int b) {
+  return a + b;
+}
+
+// But they only work with numbers
+char * string() {
+  return "Hello, world!";
+}</code></pre>
+
+            <h3>Compiling the WASM binary</h3>
+            <p>
+                Now the first step is to build a WASM binary from this. WASM is supported by
+                LLVM, so all we need to do to compile our <code>module.c</code> file is running:
+            </p>
+            <aside>
+                If you're on macOS, the default LLVM shipped by Apple does not support WASM. But you
+                can easily install one that does via e.g. homebrew using <code>brew install llvm</code>.
+            </aside>
+<pre><code class="language-bash">clang --target=wasm32 --no-standard-libraries -Wl,--export-all -Wl,--no-entry -o module.wasm module.c</code></pre>
+
+            <h3>Let's unpack this command</h3>
+            <ul>
+                <li>
+                    <code>--target=wasm32</code> tells LLVM that we want to produce a WebAssebly binary
+                </li>
+                <li>
+                    <code>--no-standard-libraries</code> does exactly what it says; this means we
+                    won't have access to things like <code>&lt;stdlib.h&gt;</code>,
+                    <code>&lt;stdio.h&gt;</code>, or <code>&lt;string.h&gt;</code>
+                </li>
+                <li>
+                    <code>-Wl,--export-all</code> tells the linker to export all symbols
+                </li>
+                <li>
+                    <code>-Wl,--no-entry</code> tells the linker we don't need a <code>main</code>
+                    function
+                </li>
+                <li>
+                    <code>-o module.wasm</code> specifies the output file
+                </li>
+            </ul>
+            <p>
+                Having build our module, we can now proceed to using the functions it exports. In Deno,
+                creating a WebAssembly instance is super simple:
+            </p>
+<pre><code class="language-javascript">import * as module from "./module.wasm";
+console.log(module);</code></pre>
+            <p>should output:</p>
+<pre><code>{ __data_end, __dso_handle, __global_base, __heap_base, __wasm_call_ctors, add, count, memory, string, total_count }</code></pre>
+
+            <h3>Calling Functions</h3>
+            <p>
+                Having done this, functions exported by the module can be called as if they were
+                regular JavaScript functions:
+            </p>
+<pre><code class="language-javascript">// ...
+console.log(module.count(), module.count(), module.count());
+// &gt; 1 2 3
+console.log("1+1 =", module.add(1, 1));
+// &gt; 1+1 = 2</code></pre>
+            <p>
+                However, there are a few things to be aware of. Firstly, until
+                <a href="https://github.com/WebAssembly/interface-types/blob/master/proposals/interface-types/Explainer.md">interface types</a>
+                are supported, WASM modules can only input and output numbers. This means that reading
+                things like strings from our WASM module is a bit more involved:
+            </p>
+            <aside>
+                This can be done more efficiently, see
+                <a href="https://github.com/dyedgreen/deno-sqlite/blob/4f7aa3234e27133aa88e8524103268275465073f/src/wasm.js#L32">here</a>
+                for an example using an optimization stolen from EMSCRIPTEN.)
+            </aside>
+<pre><code class="language-javascript">// ...
+function readString(ptr) {
+  // Get the memories bytes, starting from the beginning of the string.
+  const mem = new Uint8Array(module.memory.buffer, ptr);
+  // Find the length of the string.
+  // (doing this in C would be faster)
+  let length;
+  for (length = 0; mem[length] !== 0; length++);
+  // Decode the string (see note about optimization below)
+  return new TextDecoder("utf-8").decode(
+    new Uint8Array(mem.buffer, ptr, length),
+  );
+}
+console.log(readString(module.string()));
+// &gt; Hello, world!</code></pre>
+            <p>
+                Another limitation comes from JavaScript. In JavaScript numbers are always
+                floating point values. Specifically, they are encoded in memory in such a way
+                that there are no 64 bit integers. This means that integers are always cast to
+                32 bit if passed from JavaScript. We have to do something like the following if
+                we want maximum precision numbers:
+            </p>
+            <pre><code class="language-c">void needs_64_bit_int(long long int number) {
+  // ...
+}
+// becomes
+void needs_64_bit_int(double number_js) {
+  long long int number = (long long int)number_js;
+  // ...
+}</code></pre>
+
+            <h3>Exporting only specific functions</h3>
+            <p>
+                So far we used the <code>-Wl,--export-all</code> linker option to export all the
+                symbols declared in our module. However this also exported some symbols we don't
+                care about. To only export specific symbols we have multiple options:
+            </p>
+            <!-- TODO: Cleanup -->
+            <ul>
+            <li>Export specific symbols with a the <code>-Wl,--export,SYMBOL</code> linker flag. E.g.<br>
+            <code>-Wl,--export,count</code></li>
+            <li>Use pragmas in our code to control what gets exported. EMSCRIPTEN defines the<br>
+            macro <code>EMSCRIPTEN_KEEPALIVE</code>. We can do the same like so:
+            <pre><code class="language-c">#define KEEPALIVE __attribute__((used)) __attribute__((visibility ("default")))
+
+            // and then e.g.
+            int KEEPALIVE count() {
+              // ...
+            }
+            </code></pre>
+            </li>
+            </ul>
+            <p>We can also combine the two. E.g. it makes sense to use a pragma for your own<br>
+            code, and export standard library functions you need to access from JavaScript<br>
+            (e.g. <code>malloc</code> and <code>free</code>) using linker flags.</p>
+            <h2>EMSCRIPTEN</h2>
+            <p>So far, our module was extremely simple. We did not use any C standard<br>
+            libraries, and could compile our module directly with a standard LLVM clang<br>
+            compiler. If we need any standard headers like <code>&lt;stdlib.h&gt;</code> or <code>&lt;string.h&gt;</code>,<br>
+            this will no longer work.</p>
+            <p>Anything we want to use that doesn't know its memory requirements up front (e.g.<br>
+            uses <code>malloc</code>) will not be able to compile this way. To get these standard<br>
+            libraries, we need to use an SDK that includes libraries which run on a WASM VM.</p>
+            <p>The <a href="https://emscripten.org">EMSCRIPTEN compiler</a> provides us with an LLVM<br>
+            compiler and a posix <code>libc</code> which runs in a browser. This will also work for<br>
+            Deno, but their implementation produces a non-trivial amount of glue-code which<br>
+            is tricky to work with. It is also based on constrains which don't quite align<br>
+            with our needs, for example <a href="https://dyedgreen.github.io/deno-sqlite">deno-sqlite</a> runs faster when not<br>
+            using the EMSCRIPTEN provided glue.</p>
+            <p>The exported function for instantiating modules is also not that nice. It<br>
+            implements a <code>.then</code> (like a promise) but isn't a real promise which caused me<br>
+            all sorts of headaches.</p>
+            <p>All of this <strong>does not (!)</strong> mean that EMSCRIPTEN is bad. On the contrary, there<br>
+            are <a href="https://files.unity3d.com/jonas/AngryBots/">very impressive demos</a> that demonstrate what the compiler<br>
+            is capable of. It's just built for a different use-case.</p>
+            <h2>WASI and standard libraries</h2>
+            <p><a href="https://hacks.mozilla.org/2019/03/standardizing-wasi-a-webassembly-system-interface/">WASI</a> is short for WebAssemblySystemInterface and is an emerging<br>
+            standard which aims to let WebAssembly target environments outside of the<br>
+            browser. It is not yet supported by Deno, but they still provide a quite nice<br>
+            standard library which we can use as long as we don't use any headers that need<br>
+            sys-calls (specifically <code>&lt;stdio.h&gt;</code> is something we sadly can't use).</p>
+            <p>Note that you can use these features, if you provide the module with the<br>
+            necessary WASI imports when instantiating it. That, however, means that you<br>
+            won't be able to directly import the binary from a JavaScript file.</p>
+            <p>If you need to emulate a complete POSIX environment, you should use EMSCRIPTEN<br>
+            as your compiler. But if you can get away with not using these APIs (notably<br>
+            that is the case for wrapping SQLite), using the <code>libc</code> provided by the WASI SDK<br>
+            allows you to build <code>.wasm</code> modules which are fast and self-sufficient.</p>
+            <p>You can download the WASI SDK for your platform <a href="https://github.com/CraneStation/wasi-sdk/releases">here</a>.</p>
+            <h3>Compiling using the WASI SDK</h3>
+            <p>To compile our module, we simply need to use the clang provided by the SDK and<br>
+            specify where the linker should look for the standard libraries:</p>
+            <pre><code class="language-bash">$(WASI_SDK_DIR)/bin/clang --target=wasm32-unknown-wasi -Wl,--no-entry -nostartfiles --sysroot $(WASI_SDK_DIR)/share/wasi-sysroot
+            </code></pre>
+            <p>As before, there is a lot going on here. These are the new options:</p>
+            <ul>
+            <li><code>--target=wasm32-unknown-wasi</code> target WASM with WASI</li>
+            <li><code>-nostartfiles</code> means we don't want to link in any standard initialization<br>
+            actions provided by the OS</li>
+            <li><code>--sysroot</code> tells the linker where to find the WASI <code>libc</code></li>
+            </ul>
+            <h2>Bundling WASM files for Deno</h2>
+            <blockquote>
+            <p><strong>Update (16th Feb. 2020):</strong> This problem has been <a href="https://github.com/denoland/deno/pull/3856">resolved</a> starting<br>
+            with Deno <code>v0.33.0</code>. This section of this guide will be left here for<br>
+            completeness, but is no longer required.</p>
+            </blockquote>
+            <blockquote>
+            <p><strong>Update (18th Mar. 2020):</strong> Deno has removed <code>.wasm</code> imports for their <code>v1.0</code><br>
+            release. Thus this section is relevant again.</p>
+            </blockquote>
+            <p>This will be irrelevant once <a href="https://github.com/denoland/deno/issues/3528">this issue</a> is resolved. Until then,<br>
+            Deno will not correctly fetch <code>.wasm</code> binaries over the network. For local<br>
+            files, using</p>
+            <pre><code class="language-javascript">import * as module from "./module.wasm";
+            </code></pre>
+            <p>is fine. But to reliably import files via the network, we need to embed the WASM<br>
+            binary into our JavaScript source. (We could also fetch it dynamically, but that<br>
+            means requesting network permission and also does not play too well with<br>
+            relative imports.)</p>
+            <p>I have <a href="https://github.com/zeux/meshoptimizer/blob/f02d51c9907d30c1ce00e9efdac5e923bbb0d0d5/js/meshopt_decoder.js#L5">seen</a> people use hexadecimal encoding. This encodes 1 byte<br>
+            as 2 ASCII bytes. We can do better by using base 64 encoding to 'only' get an<br>
+            extra 33%.</p>
+            <p>A base 64 string of our binary is readily obtained, e.g. using:</p>
+            <pre><code class="language-bash">base64 module.wasm
+            </code></pre>
+            <p>It is also easily decoded in JavaScript. This gives us the following module<br>
+            file, which can be imported similarly to a bare <code>.wasm</code> as<br>
+            <code>import module from "./module.js"</code>:</p>
+            <pre><code class="language-javascript">// WASM binary
+            const base64 = "\
+            AGFzbQEAAAABBwFgAn9/AX8DAgEABAUBcA\
+            EBAQUDAQACBggBfwFBgIgECwcQAgZtZW1v\
+            cnkCAANhZGQAAAoJAQcAIAEgAGoLAA0Ebm\
+            FtZQEGAQADYWRkAD4JcHJvZHVjZXJzAQxw\
+            cm9jZXNzZWQtYnkBBWNsYW5nHjkuMC4wIC\
+            h0YWdzL1JFTEVBU0VfOTAwL2ZpbmFsKQ==\
+            ";
+
+            // Decode base 64 to typed array
+            function decode(base64) {
+              const str = atob(base64);
+              const bytes = new Uint8Array(str.length);
+              for (let i = 0; i &lt; str.length; i++) {
+                bytes[i] = str.charCodeAt(i);
+              }
+              return bytes;
+            }
+
+            // Export WASM binary instance's exports
+            const { instance } = await WebAssembly.instantiate(decode(base64));
+            export default instance.exports;
+            </code></pre>
+
+            <h2>Thank You</h2>
+            <p>
+                I'd like to end by saying thank you to the amazing people behind WebAssembly
+                and Deno. I also want to acknowledge the posts and materials I used when
+                figuring out how to do this. The following where especially useful or interesting.
+                <br><br>
+                <ul>
+                    <li><a href="https://depth-first.com/articles/2019/10/16/compiling-c-to-webassembly-and-running-it-without-emscripten/">depth-first.com - Compiling C to WebAssembly and Running It - without Emscripten</a></li>
+                    <li><a href="https://github.com/bytecodealliance/wasmtime/blob/master/docs/WASI-tutorial.md">github.com/bytecodealliance - WASI tutorial</a></li>
+                    <li><a href="https://wasi.dev">wasi.dev</a></li>
+                    <li><a href="https://developer.mozilla.org/en-US/docs/WebAssembly">developer.mozilla.org - WebAssembly</a></li>
+                    <li><a href="https://hacks.mozilla.org/2019/03/standardizing-wasi-a-webassembly-system-interface/">hacks.mozilla.org - Standardizing WASI: A system interface to run WebAssembly outside the web</a></li>
+                </ul>
+            </p>
+        </article>
     </body>
 </html>
