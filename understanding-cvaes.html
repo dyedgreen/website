@@ -6,42 +6,463 @@
         <meta name="author" content="Tilman Roeder">
         <link rel="stylesheet" href="index.css">
         <title>Building WebAssembly for Deno</title>
+        <link
+          rel="stylesheet"
+          href="https://cdn.jsdelivr.net/npm/katex@0.13.13/dist/katex.min.css"
+          integrity="sha384-RZU/ijkSsFbcmivfdRBQDtwuwVqK7GMOw6IMvKyeWL2K5UAlyp6WonmB8m7Jd0Hn"
+          crossOrigin="anonymous">
+        <script
+          defer
+          src="https://cdn.jsdelivr.net/npm/katex@0.13.13/dist/katex.min.js"
+          integrity="sha384-pK1WpvzWVBQiP0/GjnvRxV4mOb0oxFuyRxJlk6vVw146n3egcN5C925NCP7a7BY8"
+          crossOrigin="anonymous"></script>
+        <script
+          defer
+          src="https://cdn.jsdelivr.net/npm/katex@0.13.13/dist/contrib/auto-render.min.js"
+          integrity="sha384-vZTG03m+2yp6N6BNi5iM4rW4oIwk5DfcNdFfxkk9ZWpDriOkXX8voJBFrAO7MpVl"
+          crossOrigin="anonymous"
+          onLoad="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'$',right:'$',display:false}]});"></script>
     </head>
     <body>
         <nav>
             <a href="/">← homepage</a>
-            <h2>Tilman Roeder &mdash; Dec 23 2019</h2>
+            <h2>Tilman Roeder &mdash; Sep 28 2018</h2>
         </nav>
         <header>
-            <h1 class="title">Building WebAssembly for Deno</h1>
+            <h1 class="title">Understanding CVAEs</h1>
         </header>
         <article>
-            <p>When trying to set up a bash script to update the wallpaper on my Mac, I ran<br>
-            into this wired issue. Basically, the wallpapers of each space / desktop are<br>
-            really <em>smart</em> and change independently :zany_face:. So after some frantic Internet<br>
-            searches, I found out the following:</p>
-            <ul>
-            <li>The different spaces seem to be managed by the Dock (?, at least their stuff<br>
-            is stored in <code>~/Library/Application\ Support/Dock/</code>)</li>
-            <li>Which picture each desktop should have is stored in an SQLite database file</li>
-            <li>The image paths are stored in the <code>data</code> table (the relevant column is<br>
-            <code>value</code>)</li>
-            <li>To apply the changes, you have to restart the Dock</li>
-            <li>If you want to change to also apply to different monitors and behind your<br>
-            fullscreen windows, there is a neat little AppleScript for that:</li>
-            </ul>
-            <h1>TL;DR</h1>
-            <pre><code class="language-bash">function background {
-              IMG=$1
-              osascript -e "tell application \"System Events\" to set picture of every desktop to \"${IMG}\""
-              sqlite3 ~/Library/Application\ Support/Dock/desktoppicture.db "update data set value = '${IMG}'"
-              killall Dock
+        <p>Conditional Variational Auto-Encoders are a tool for modeling <span
+        class="math inline">p(y\|x)</span>. Variational Auto-Encoders allow us
+        to generate new samples, that look like they come from the training
+        dataset. CVAEs take this a step further and allow us to generate samples
+        that also satisfy a specified condition.</p>
+        <p>In practice, this allows us to do things like generate specific
+        digits that look like they come from MNIST.</p>
+        <h3 id="interactive-example">Interactive Example</h3>
+        <p><em>Enter a number of your choice and have a pre-trained cvae
+        generate it as hand-written digits. This demo runs in your browser and
+        may be slower on old devices. Getting bad results? Please note that the
+        learned model parameters are rounded aggressively to improve page-load
+        performance.</em></p>
+        <!-- DEMO START -->
+        <input id="demo-input" type="number" max="9999999999" min="0" value="1234567890">
+        <a id="demo-button" class="button" href="javascript:void(0)"> <span
+        class="button__text">Generate</span> </a>
+        <div id="demo-canvas-wrapper">
+        <canvas id="demo-canvas">
+        </canvas>
+        </div>
+        <style type="text/css">
+          input#demo-input {
+            height: 40px;
+            width: 300px;
+            max-width: 100%;
+            display: block;
+            margin: 15px auto;
+            padding: 0 10px;
+            font-size: inherit;
+            color: inherit;
+            background: inherit;
+            border: 2px solid rgba(0,0,0,0.2);
+          }
+          a#demo-button {
+            width:  100%;
+            display: block;
+            margin: 5px auto;
+            text-align: center;
+            text-decoration: none;
+            text-transform: uppercase;
+          }
+          div#demo-canvas-wrapper {
+            height: 0;
+            width: 100%;
+            display: block;
+            position: relative;
+            padding-top: 10%;
+          }
+          canvas#demo-canvas {
+            width: 100%;
+            height: 100%;
+            position: absolute;
+            top: 0;
+            left: 0;
+          }
+          @media (prefers-color-scheme: dark) {
+            canvas#demo-canvas {
+              filter: invert(1);
             }
-            </code></pre>
-            <p>Let's hope this post will save someone like me a few searches and head-scratches 😅.<br>
-            By the way, I use <a href="https://unsplash.com">Unsplash</a> to download the fresh<br>
-            backgrounds, and have amassed<br>
-            <a href="https://unsplash.com/collections/4764121/">a nice little collection of suitable pictures</a>.</p>
+          }
+        </style>
+        <script type="text/javascript" src="js/matrix.js" defer></script>
+        <script type="text/javascript" src="js/cvae.js" defer></script>
+        <!-- DEMO END -->
+        <p>So, how does this work? I will explain the mathematical reasoning
+        behind the algorithm first. Then I will outline how the mathematics can
+        be translated into code, using Python and <a
+        href="https://pytorch.org">PyTorch</a>. If you want to jump straight
+        into the code, you can have a look at <a
+        href="https://github.com/dyedgreen/conditional-vae">the GitHub
+        repository</a> for this article.</p>
+        <h2 id="auto-encoding-variational-bayes">Auto-Encoding Variational
+        Bayes</h2>
+        <p>Let’s start out by asking the following question: How can we model
+        the distribution <span class="math inline">p(y)</span>?</p>
+        <p>We start by assuming that we are given a dataset $ =
+        \{y<sup>{(i)}}</sup>N_{i=1} $ with independent and identically
+        distributed (i.i.d.) samples. To make the problem tractable, we will
+        also assume that the random process which produces the dataset involves
+        a random latent variable <span class="math inline">z</span>, with a
+        known distribution <span class="math inline">p(z)</span>. (This latent
+        variable is why the method is called <em>auto-encoding</em> variational
+        Bayes.)</p>
+        <p>Additionally assuming we have a parameterized distribution <span
+        class="math inline">p_{\theta}(y\|z)</span>, we can now state our
+        training objective: We want to maximize</p>
+        <p><span class="math display"> \log p\_{\theta}(\mathcal{D}) = \log
+        p\_{\theta}(y^{(1)}, \ldots, y^{(N)}) =
+        \sum\_{i=1}^N \log p\_{\theta}(y^{(i)}), </span></p>
+        <p>where $ p_{}(y^{(i)}) = _z p_{}(y|z) p(z) z $, w.r.t. (with respect
+        to) $ $. That is, we want to maximize the log-probability of the dataset
+        given our model distribution.</p>
+        <p>Conceptually, there is no difficulty here. However, in practice,
+        marginalizing <span class="math inline">z</span> (computing the
+        integral) is far to expensive for any interesting problem. The key
+        insight that allows us to deal with this, is recognizing that for most
+        <span class="math inline">z</span> we will get: <span
+        class="math inline">p(y\|z) \approx 0</span>. So instead of integrating
+        over all <span class="math inline">z</span>, we could just focus on
+        those that are likely to produce the desired <span
+        class="math inline">y</span>.</p>
+        <p>Since we don’t know which <span class="math inline">z</span> are
+        likely to give a valid <span class="math inline">y</span>, we introduce
+        a second parameterized distribution: $ q_{}(z|y) $. We will use this
+        distribution to approximate <span class="math inline">p(z|y)</span>
+        during training.</p>
+        <h3 id="recap">Recap</h3>
+        <p>So far we introduced a few functions we want to learn, as well as
+        functions we know or care about. They are:</p>
+        <ul>
+        <li>$ p(y) $ - The function we want to model.</li>
+        <li>$ p(z) $ - A function we assume we know. (In practice, we usually
+        choose a Gaussian with unit variance.)</li>
+        <li>$ p_{}(y|z) $ - The function we want to learn. Since we know <span
+        class="math inline">p(z)</span>, this gives us <span
+        class="math inline">p(y)</span>.</li>
+        <li>$ p(z|y) $ - A function we would like to know but don’t know.
+        Knowing it would help with training.</li>
+        <li>$ q_{}(z|y) $ - A function we can use to approximate <span
+        class="math inline">p(z\|y)</span>.</li>
+        </ul>
+        <p>Notice that we have to choose a parametric form for the functions we
+        want to learn. So we know $ p_{}(y|z) $ and $ q_{}(z|y) $, but not the
+        correct $ $.</p>
+        <p>Now we can take this mess of functions and apply some statistics to
+        tidy it up. To this end let me introduce the:</p>
+        <h3 id="kullback-leiber-divergence">Kullback-Leiber Divergence</h3>
+        <p>The <a
+        href="https://en.wikipedia.org/wiki/Kullback-Leibler_divergence">KL-Divergence</a>
+        measures the difference between two distributions and is defined as:</p>
+        <p><span class="math display"> \mathcal{D}\_{KL}[P(A)\|\|Q(A)] = -
+        \mathbb{E}\_{A \sim
+        P(A)}[\log\frac{Q(A)}{P(A)}] = \sum\_i P(A\_i)
+        \log\frac{P(A\_i)}{Q(A\_i)}. </span></p>
+        <p>An important property of the KL-Divergence is that it is always
+        non-negative. Now we have all the tools we need to find a lower bound on
+        $ p_{}() $.</p>
+        <h3 id="the-variational-lower-bound">The Variational Lower Bound</h3>
+        <p>We start by applying <a
+        href="https://en.wikipedia.org/wiki/Bayes%27_theorem">Bayes Law</a>,
+        which tells us that $p(z|y) = p(y|z) $, to:</p>
+        <p><span class="math display">
+        \mathcal{D}\_{KL}[q\_{\theta}(z\|y)\|\|p(z\|y)] = \\\\ \mathbb{E}\_{z
+        \sim
+        q\_{\theta}(z\|y)}[\log q\_{\theta}(z\|y) - \log p\_{\theta}(y\|z) -
+        \log p(z) +
+        \log p(y)]. </span></p>
+        <p>Rearranging the whole thing a bit, and moving the $ p(y) $ term out
+        of the expectation, as it has no dependence on $ z $, we get:</p>
+        <p><span class="math display"> \log p(y) -
+        \mathcal{D}\_{KL}[q\_{\theta}(z\|y)\|\|p(z\|y)] = \\\\
+        \mathbb{E}\_{z \sim q\_{\theta}(z\|y)}[\log p\_{\theta}(y\|z)] -
+        \mathcal{D}\_{KL}[q\_{\theta}(z\|y)\|\|p(z)]. </span></p>
+        <p>Unless you are familiar with the KL-Divergence, this may not really
+        look like progress. However, we already have (most of) the pieces to
+        start writing some code.</p>
+        <p>Looking at the left-hand-side, we see our original objective, which
+        is great. But we also see the KL-Divergence between our approximation $
+        q_{}(z|y) $ and the true distribution <span
+        class="math inline">p(z\|y)</span>, which means that by maximizing the
+        left-hand-side, we will also obtain that approximation as an added
+        bonus.</p>
+        <p>Since the KL-Divergence is always positive, the left-hand-side is a
+        lower bound of <span class="math inline">\log p(y)</span>. It is called
+        the <em>variational lower bound</em>.</p>
+        <p>The right hand side now only contains quantities we know, so we can
+        now perform optimization using a gradient based optimizer like <a
+        href="https://en.wikipedia.org/wiki/Stochastic_gradient_descent">SGD</a>
+        or <a href="https://arxiv.org/abs/1412.6980">Adam</a>.</p>
+        <h2 id="pytorch-implementation-of-variational-bayes">PyTorch
+        Implementation of Variational Bayes</h2>
+        <p>Now that we saw the maths, I will explain how to implement the method
+        using Python and <a href="https://pytorch.org">PyTorch</a>. The full
+        source code can be found in <a
+        href="https://github.com/dyedgreen/conditional-vae">this GitHub
+        repository</a>. Here, I will only cover the model and the loss
+        function.</p>
+        <p>Before we jump into the code, we need to make a few decisions.
+        Earlier, we assumed we knew $ p(z) $ and had parametric functions for $
+        p_{}(y|z) $ and $ q_{}(z|y) $. Now we need to be a bit more
+        concrete.</p>
+        <p>Since it’s mathematically convenient and we can sample from it, we
+        make the choice:</p>
+        <p><span class="math display"> p(z) = \mathcal{N}(z\|\mu = 0, \sigma^2 =
+        1), </span></p>
+        <p>where <span class="math inline">\mathcal{N}</span> denotes the <a
+        href="https://en.wikipedia.org/wiki/Normal_distribution">Normal or
+        Gaussian distribution</a>. As for the parametric distributions, we
+        decide to use:</p>
+        <p><span class="math display"> p\_{\theta}(y\|z) = \mathcal{N}(y\|\mu =
+        f\_{\theta}(z), \sigma^2 = 1) </span></p>
+        <p>and</p>
+        <p><span class="math display"> q\_{\theta}(z\|y) = \mathcal{N}(y\|\mu =
+        g\_{\theta}(y), \sigma^2 =
+        h\_{\theta}(y)). </span></p>
+        <p>For the parametric functions <span
+        class="math inline">f\_{\theta}</span>, <span
+        class="math inline">g\_{\theta}</span> and <span
+        class="math inline">h\_{\theta}</span>, we use fully-connected neural
+        networks with <a
+        href="https://en.wikipedia.org/wiki/Rectifier_(neural_networks)">linear-rectifiers</a>
+        as our non-linearity. (Except for the last layer of <span
+        class="math inline">f\_{\theta}</span>, which uses <a
+        href="https://en.wikipedia.org/wiki/Sigmoid_function">sigmoid</a>).</p>
+        <h3 id="defining-our-model">Defining our Model</h3>
+        <p>We start with defining these functions:</p>
+        <div class="sourceCode" id="cb1"><pre
+        class="sourceCode python"><code class="sourceCode python"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="kw">class</span> Model(nn.Module):</span>
+        <span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a></span>
+        <span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a>    <span class="kw">def</span> <span class="fu">__init__</span>(<span class="va">self</span>):</span>
+        <span id="cb1-4"><a href="#cb1-4" aria-hidden="true" tabindex="-1"></a>        <span class="bu">super</span>().<span class="fu">__init__</span>()</span>
+        <span id="cb1-5"><a href="#cb1-5" aria-hidden="true" tabindex="-1"></a></span>
+        <span id="cb1-6"><a href="#cb1-6" aria-hidden="true" tabindex="-1"></a>        <span class="va">self</span>.encoder <span class="op">=</span> nn.Sequential(</span>
+        <span id="cb1-7"><a href="#cb1-7" aria-hidden="true" tabindex="-1"></a>            nn.Linear(<span class="dv">28</span><span class="op">**</span><span class="dv">2</span>, <span class="dv">512</span>),</span>
+        <span id="cb1-8"><a href="#cb1-8" aria-hidden="true" tabindex="-1"></a>            nn.ReLU(),</span>
+        <span id="cb1-9"><a href="#cb1-9" aria-hidden="true" tabindex="-1"></a>            nn.Linear(<span class="dv">512</span>, <span class="dv">512</span>),</span>
+        <span id="cb1-10"><a href="#cb1-10" aria-hidden="true" tabindex="-1"></a>            nn.ReLU()</span>
+        <span id="cb1-11"><a href="#cb1-11" aria-hidden="true" tabindex="-1"></a>        )</span>
+        <span id="cb1-12"><a href="#cb1-12" aria-hidden="true" tabindex="-1"></a></span>
+        <span id="cb1-13"><a href="#cb1-13" aria-hidden="true" tabindex="-1"></a>        <span class="va">self</span>.mu <span class="op">=</span> nn.Linear(<span class="dv">512</span>, <span class="dv">256</span>)</span>
+        <span id="cb1-14"><a href="#cb1-14" aria-hidden="true" tabindex="-1"></a>        <span class="va">self</span>.log_var <span class="op">=</span> nn.Linear(<span class="dv">512</span>, <span class="dv">256</span>)</span>
+        <span id="cb1-15"><a href="#cb1-15" aria-hidden="true" tabindex="-1"></a></span>
+        <span id="cb1-16"><a href="#cb1-16" aria-hidden="true" tabindex="-1"></a>        <span class="va">self</span>.decoder <span class="op">=</span> nn.Sequential(</span>
+        <span id="cb1-17"><a href="#cb1-17" aria-hidden="true" tabindex="-1"></a>            nn.Linear(<span class="dv">256</span>, <span class="dv">512</span>),</span>
+        <span id="cb1-18"><a href="#cb1-18" aria-hidden="true" tabindex="-1"></a>            nn.ReLU(),</span>
+        <span id="cb1-19"><a href="#cb1-19" aria-hidden="true" tabindex="-1"></a>            nn.Linear(<span class="dv">512</span>, <span class="dv">512</span>),</span>
+        <span id="cb1-20"><a href="#cb1-20" aria-hidden="true" tabindex="-1"></a>            nn.ReLU(),</span>
+        <span id="cb1-21"><a href="#cb1-21" aria-hidden="true" tabindex="-1"></a>            nn.Linear(<span class="dv">512</span>, <span class="dv">28</span><span class="op">**</span><span class="dv">2</span>),</span>
+        <span id="cb1-22"><a href="#cb1-22" aria-hidden="true" tabindex="-1"></a>            nn.Sigmoid()</span>
+        <span id="cb1-23"><a href="#cb1-23" aria-hidden="true" tabindex="-1"></a>        )</span>
+        <span id="cb1-24"><a href="#cb1-24" aria-hidden="true" tabindex="-1"></a></span>
+        <span id="cb1-25"><a href="#cb1-25" aria-hidden="true" tabindex="-1"></a>    ...</span></code></pre></div>
+        <p>Our model looks a bit like an auto-encoder, which is why I choose to
+        call the functions <code>encoder</code> and <code>decoder</code>.
+        <code>decoder</code> corresponds to <span
+        class="math inline">f\_{\theta}</span>, while we use weight-sharing for
+        <span class="math inline">g\_{\theta}</span> and <span
+        class="math inline">h\_{\theta}</span>, so that
+        <code>mu(encoder(y))</code> is <span
+        class="math inline">g\_{\theta}</span> and
+        <code>log_var(encoder(y))</code> is <span class="math inline">\log
+        h\_{\theta}(y)</span>.</p>
+        <p>Notice that we use the logarithm, as this will help with numeric
+        stability.</p>
+        <p>Now we want to be able to train these parameters using stochastic
+        gradients. To do this, we define the forward pass of our model:</p>
+        <div class="sourceCode" id="cb2"><pre
+        class="sourceCode python"><code class="sourceCode python"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="kw">class</span> Model(nn.Module):</span>
+        <span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a></span>
+        <span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a>    ...</span>
+        <span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a></span>
+        <span id="cb2-5"><a href="#cb2-5" aria-hidden="true" tabindex="-1"></a>    <span class="kw">def</span> forward(<span class="va">self</span>, x):</span>
+        <span id="cb2-6"><a href="#cb2-6" aria-hidden="true" tabindex="-1"></a>        <span class="co"># Find parameters for latent distribution</span></span>
+        <span id="cb2-7"><a href="#cb2-7" aria-hidden="true" tabindex="-1"></a>        h <span class="op">=</span> <span class="va">self</span>.encoder(x.view(<span class="op">-</span><span class="dv">1</span>, <span class="dv">28</span><span class="op">**</span><span class="dv">2</span>))</span>
+        <span id="cb2-8"><a href="#cb2-8" aria-hidden="true" tabindex="-1"></a>        mu <span class="op">=</span> <span class="va">self</span>.mu(h)</span>
+        <span id="cb2-9"><a href="#cb2-9" aria-hidden="true" tabindex="-1"></a>        z <span class="op">=</span> mu</span>
+        <span id="cb2-10"><a href="#cb2-10" aria-hidden="true" tabindex="-1"></a></span>
+        <span id="cb2-11"><a href="#cb2-11" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="va">self</span>.training:</span>
+        <span id="cb2-12"><a href="#cb2-12" aria-hidden="true" tabindex="-1"></a>            <span class="co"># Re-parametrization trick</span></span>
+        <span id="cb2-13"><a href="#cb2-13" aria-hidden="true" tabindex="-1"></a>            <span class="co"># (move sampling to input)</span></span>
+        <span id="cb2-14"><a href="#cb2-14" aria-hidden="true" tabindex="-1"></a>            log_var <span class="op">=</span> <span class="va">self</span>.log_var(h)</span>
+        <span id="cb2-15"><a href="#cb2-15" aria-hidden="true" tabindex="-1"></a>            eps <span class="op">=</span> torch.randn_like(mu)</span>
+        <span id="cb2-16"><a href="#cb2-16" aria-hidden="true" tabindex="-1"></a>            z <span class="op">=</span> eps.mul(log_var.mul(<span class="fl">0.5</span>).exp()).add_(mu)</span>
+        <span id="cb2-17"><a href="#cb2-17" aria-hidden="true" tabindex="-1"></a></span>
+        <span id="cb2-18"><a href="#cb2-18" aria-hidden="true" tabindex="-1"></a>        r <span class="op">=</span> <span class="va">self</span>.decoder(z).view(<span class="op">-</span><span class="dv">1</span>, <span class="dv">1</span>, <span class="dv">28</span>, <span class="dv">28</span>)</span>
+        <span id="cb2-19"><a href="#cb2-19" aria-hidden="true" tabindex="-1"></a></span>
+        <span id="cb2-20"><a href="#cb2-20" aria-hidden="true" tabindex="-1"></a>        <span class="co"># Only return p(z|x) parameters if training</span></span>
+        <span id="cb2-21"><a href="#cb2-21" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="va">self</span>.training:</span>
+        <span id="cb2-22"><a href="#cb2-22" aria-hidden="true" tabindex="-1"></a>            <span class="cf">return</span> (r, mu, log_var)</span>
+        <span id="cb2-23"><a href="#cb2-23" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> r</span></code></pre></div>
+        <p><em>Notice that the variable we model is called <code>x</code> in the
+        code, whereas we called it <span class="math inline">y</span> when going
+        through the mathematics.</em></p>
+        <p>This piece of code contains something very important: The
+        <em>re-parametrization trick</em>. Our objective requires us to compute
+        the expectation of <span class="math inline">z \sim
+        q\_{\theta}(z\|y)</span>. To improve performance, we will approximate
+        this expectation by sampling from <span
+        class="math inline">q\_{\theta}(z\|y)</span>.</p>
+        <p>However, sampling from a random distribution is a non-differentiable
+        process, which prevents us from using gradient based optimization
+        methods. To get ourselves out of this one, we instead introduce a new
+        random variable <span class="math inline">\epsilon
+        \sim \mathcal{N}(\epsilon\|0,1)</span>. Rather than sampling <span
+        class="math inline">z</span> directly, we find it as:</p>
+        <p><span class="math display"> z = \epsilon \times \sqrt{\sigma^2} + \mu
+        = \epsilon \times
+        \sqrt{h\_{\theta}(y)} + g\_{\theta}(y) </span></p>
+        <p>This <em>re-parametrization</em> effectively moves the sampling
+        operation to the input, which means that we can once more compute
+        gradients w.r.t all parameters.</p>
+        <h3 id="defining-the-loss-function">Defining the loss function</h3>
+        <p>The second thing we need to give <a
+        href="https://pytorch.org">PyTorch</a> so that we can train our model is
+        a loss function. Since we want to maximize our objective w.r.t. our
+        parameters, the loss function will be the negative of the objective:</p>
+        <p><span class="math display">
+        \mathcal{D}\_{KL}[q\_{\theta}(z\|y)\|\|p(z)] - \mathbb{E}\_{z \sim
+        q\_{\theta}(z\|y)}[\log p\_{\theta}(y\|z)] \approx
+        \mathcal{D}\_{KL}[q\_{\theta}(z\|y)\|\|p(z)] - \log p\_{\theta}(y\|z)
+        </span></p>
+        <p>Written using PyTorch, this becomes:</p>
+        <div class="sourceCode" id="cb3"><pre
+        class="sourceCode python"><code class="sourceCode python"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> loss_fn(x, r, mu, log_var):</span>
+        <span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a>    <span class="co"># Reconstruction loss</span></span>
+        <span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a>    loss_r <span class="op">=</span> F.binary_cross_entropy(r, x, reduction<span class="op">=</span><span class="st">&quot;sum&quot;</span>)</span>
+        <span id="cb3-4"><a href="#cb3-4" aria-hidden="true" tabindex="-1"></a>    <span class="co"># KL Divergence</span></span>
+        <span id="cb3-5"><a href="#cb3-5" aria-hidden="true" tabindex="-1"></a>    loss_kl <span class="op">=</span> <span class="op">-</span> <span class="fl">0.5</span> <span class="op">*</span> (<span class="dv">1</span> <span class="op">+</span> log_var <span class="op">-</span> mu<span class="op">**</span><span class="dv">2</span> <span class="op">-</span> log_var.exp()).<span class="bu">sum</span>()</span>
+        <span id="cb3-6"><a href="#cb3-6" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> loss_r <span class="op">+</span> loss_kl</span></code></pre></div>
+        <p><em>Notice that <code>x</code> is <span class="math inline">y</span>
+        and <code>r</code> is <span class="math inline">f\_{\theta}</span>,
+        while <code>mu</code> and <code>log_var</code> are the parameters of the
+        distribution <span
+        class="math inline">p\_{\theta}(z\|y)</span>.</em></p>
+        <p>The KL-Divergence term is easy to explain: It is simply the analytic
+        solution, given our choice of distributions. (See the appendix of <a
+        href="https://arxiv.org/abs/1312.6114">Auto-Encoding Variational
+        Bayes</a> for a derivation.)</p>
+        <p>For the <span class="math inline">\log p\_{\theta}(y\|z)</span> term
+        (reconstruction loss), the choice of loss is motivated as follows: We
+        know that, since our distribution is Gaussian, its mode (maximum) is at
+        <span class="math inline">y=\mu</span> (the expectation). So we maximize
+        the probability of <span class="math inline">y</span> iff (if and only
+        if) <span class="math inline">\mu = f\_{\theta} = y</span>. In other
+        words: We want <span class="math inline">f\_{\theta}</span> to reproduce
+        the original variable <span class="math inline">y</span>. Instead of
+        binary cross entropy, we could also have chosen something like mean
+        square error. Any loss that is minimized for <span
+        class="math inline">f\_{\theta} = y</span> should work in principle.</p>
+        <p>The rest of the code simply loads MNIST and preforms a gradient based
+        minimization of our loss using <a
+        href="https://arxiv.org/abs/1412.6980">Adam</a>.</p>
+        <p>I encourage you, to download the <a
+        href="https://github.com/dyedgreen/conditional-vae">code from GitHub</a>
+        and run the example <code>vae.py</code> yourself, and try to play with
+        it a bit. The results should look something like this:</p>
+        <figure>
+        <img src="/images/blog/vae-mnist.png" alt="Generated MNIST digits" />
+        <figcaption aria-hidden="true">Generated MNIST digits</figcaption>
+        </figure>
+        <h2 id="conditional-variational-bayes">Conditional Variational
+        Bayes</h2>
+        <p>So far we can sample from <span class="math inline">p(y) =
+        p\_{\theta}(y\|z) p(z)</span>, but whenever we sample from this
+        distribution, we get an image of a random digit. It would be much
+        cooler, if we could also specify, which digit we want. (Like in the
+        interactive example at the beginning.)</p>
+        <p>To do this, we need to model the conditional distribution <span
+        class="math inline">p(y|x)</span>, where <span
+        class="math inline">x</span> represents the digit we want.</p>
+        <p>We will consider the case, where the latent variables <span
+        class="math inline">z</span> are independent from the input variables
+        <span class="math inline">x</span>, since this case will allow us to use
+        the same loss function as before.</p>
+        <h3 id="functions-of-interest">Functions of interest</h3>
+        <p>As before, there are a few functions we need to keep in mind:</p>
+        <ul>
+        <li>$ p(y|x) $ - The function we want to model.</li>
+        <li>$ p(z) $ - A function we assume we know. (This is the same as
+        before.)</li>
+        <li>$ p_{}(y|z,x) $ - The function we want to learn. Since we know <span
+        class="math inline">p(z)</span>, this gives us <span
+        class="math inline">p(y).</span></li>
+        <li>$ p(z|y,x) $ - A function we would like to know but don’t know.
+        Knowing it would help with training.</li>
+        <li>$ q_{}(z|y,x) $ - A function we can use to approximate <span
+        class="math inline">p(z\|y,x).</span></li>
+        </ul>
+        <h3 id="the-new-variational-lower-bound">The (New) Variational Lower
+        Bound</h3>
+        <p>In complete analogy to before we use Bayes theorem, which tells us
+        that $p(z|y,x) = p(y|z,x) $. Using the same procedure as for the not
+        conditioned case, we finally obtain:</p>
+        <p><span class="math display"> \log p(y\|x) -
+        \mathcal{D}\_{KL}[q\_{\theta}(z\|y,x)\|\|p(z\|y,x)] =\\\\
+        \mathbb{E}\_{z \sim q\_{\theta}(z\|y,x)}[\log p\_{\theta}(y\|z,x)] -
+        \mathcal{D}\_{KL}[q\_{\theta}(z\|y,x)\|\|p(z)]. </span></p>
+        <h3 id="changes-to-the-code">Changes to the Code</h3>
+        <p>When it comes to implementing this condition model in PyTorch, we can
+        basically almost copy our previous code. The only change we need to make
+        is to include <span class="math inline">x</span> as the input in both
+        our <code>encoder</code> and <code>decoder</code>. To this end, we amend
+        them as follows:</p>
+        <div class="sourceCode" id="cb4"><pre
+        class="sourceCode python"><code class="sourceCode python"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a>...</span>
+        <span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a></span>
+        <span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a><span class="va">self</span>.encoder <span class="op">=</span> nn.Sequential(</span>
+        <span id="cb4-4"><a href="#cb4-4" aria-hidden="true" tabindex="-1"></a>    nn.Linear(<span class="dv">28</span><span class="op">**</span><span class="dv">2</span> <span class="op">+</span> <span class="dv">10</span>, <span class="dv">512</span>),</span>
+        <span id="cb4-5"><a href="#cb4-5" aria-hidden="true" tabindex="-1"></a>    nn.ReLU(),</span>
+        <span id="cb4-6"><a href="#cb4-6" aria-hidden="true" tabindex="-1"></a>    nn.Linear(<span class="dv">512</span>, <span class="dv">512</span>),</span>
+        <span id="cb4-7"><a href="#cb4-7" aria-hidden="true" tabindex="-1"></a>    nn.ReLU()</span>
+        <span id="cb4-8"><a href="#cb4-8" aria-hidden="true" tabindex="-1"></a>)</span>
+        <span id="cb4-9"><a href="#cb4-9" aria-hidden="true" tabindex="-1"></a></span>
+        <span id="cb4-10"><a href="#cb4-10" aria-hidden="true" tabindex="-1"></a>...</span>
+        <span id="cb4-11"><a href="#cb4-11" aria-hidden="true" tabindex="-1"></a></span>
+        <span id="cb4-12"><a href="#cb4-12" aria-hidden="true" tabindex="-1"></a><span class="va">self</span>.decoder <span class="op">=</span> nn.Sequential(</span>
+        <span id="cb4-13"><a href="#cb4-13" aria-hidden="true" tabindex="-1"></a>    nn.Linear(<span class="dv">256</span> <span class="op">+</span> <span class="dv">10</span>, <span class="dv">512</span>),</span>
+        <span id="cb4-14"><a href="#cb4-14" aria-hidden="true" tabindex="-1"></a>    nn.ReLU(),</span>
+        <span id="cb4-15"><a href="#cb4-15" aria-hidden="true" tabindex="-1"></a>    nn.Linear(<span class="dv">512</span>, <span class="dv">512</span>),</span>
+        <span id="cb4-16"><a href="#cb4-16" aria-hidden="true" tabindex="-1"></a>    nn.ReLU(),</span>
+        <span id="cb4-17"><a href="#cb4-17" aria-hidden="true" tabindex="-1"></a>    nn.Linear(<span class="dv">512</span>, <span class="dv">28</span><span class="op">**</span><span class="dv">2</span>),</span>
+        <span id="cb4-18"><a href="#cb4-18" aria-hidden="true" tabindex="-1"></a>    nn.Sigmoid()</span>
+        <span id="cb4-19"><a href="#cb4-19" aria-hidden="true" tabindex="-1"></a>)</span>
+        <span id="cb4-20"><a href="#cb4-20" aria-hidden="true" tabindex="-1"></a></span>
+        <span id="cb4-21"><a href="#cb4-21" aria-hidden="true" tabindex="-1"></a>...</span></code></pre></div>
+        <p>We will be passing <span class="math inline">x</span> by
+        concatenating the previous input with a vector which is given by:</p>
+        <p><span class="math display"> \vec{x}\_i = \\{^{1,\text{ }i =
+        \text{number}}\_{0,\text{ otherwise}}. </span></p>
+        <p>We can interpret this vector as given the probability that <span
+        class="math inline">y</span> is the respective number.</p>
+        <p>As before, you should have a look at the <a
+        href="https://github.com/dyedgreen/conditional-vae">code on GitHub</a>
+        to see all the adjustments we need to make in the conditioned case. You
+        can also run the example <code>cvae.py</code> to see the training
+        process. The interactive example at the beginning of the article was
+        trained using this model.</p>
+        <h2 id="references---read-the-papers">References - Read the Papers</h2>
+        <p>These papers are where all of the above ideas originate. If you want
+        to dive deeper, you should read some of them.</p>
+        <ul>
+        <li><a href="https://arxiv.org/abs/1312.6114">Auto-Encoding Variational
+        Bayes</a></li>
+        <li><a href="https://arxiv.org/abs/1606.05908">Tutorial on Variational
+        Autoencoders</a></li>
+        <li><a
+        href="https://papers.nips.cc/paper/5775-learning-structured-output-representation-using-deep-conditional-generative-models">Learning
+        Structured Output Representation using Deep Conditional Generative
+        Models</a></li>
+        </ul>
         </article>
     </body>
 </html>
